@@ -1,0 +1,183 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+die "\nuse: $0 input[._]R1.fastq(.gz) input[._]R2.fastq(.gz) out.tsv (whiteList)\n\n" unless $#ARGV >= 2;
+
+my $inFq1 = $ARGV[0];
+my $inFq2 = $ARGV[1];
+my $OutTsv = $ARGV[2];
+my $whiteList = defined $ARGV[3] ? $ARGV[3] : undef;
+
+select STDOUT;
+$| = 1;
+
+my $pattern = uc("(..............................................)cgatatcgccaccgtggctgaatgagactggt") =~ s/N/./rg;
+print STDOUT "[pattern] R2-pattern:${pattern}\n";
+
+my %WL;
+if (defined $whiteList) {
+	$whiteList =~ /.gz$/ ? 
+		(open(WL, "gunzip -c $whiteList |") or die $!) : 
+		(open(WL, $whiteList) or die $!);
+	while (<WL>) {
+		chomp;
+		s/-\d+$//;
+		$WL{$_}++;
+	}
+	# Assume the whiteList is already sorted
+	close WL;
+}
+
+$inFq1 =~ /.gz$/ ? 
+	(open FQ1, "gunzip -c $inFq1 |" or die $!) : 
+	(open FQ1, $inFq1 or die $!);
+$inFq2 =~ /.gz$/ ? 
+	(open FQ2, "gunzip -c $inFq2 |" or die $!) : 
+	(open FQ2, $inFq2 or die $!);
+open OUT, "> $OutTsv" or die $!;
+select OUT;
+$| = 1;
+
+
+my $nseq = 0;
+my $nseqmis = 0;
+my $time0 = time();
+my %result;
+while (defined(my $head1 = <FQ1>) and defined(my $head2 = <FQ2>)) {
+	my $rawseq1 = <FQ1>;
+	my $plus1 = <FQ1>;
+	my $qseq1 = <FQ1>;
+	my $rawseq2 = <FQ2>;
+	my $plus2 = <FQ2>;
+	my $qseq2 = <FQ2>;
+	chomp $head1;
+	chomp $rawseq1;
+	chomp $qseq1;
+	chomp $head2;
+	chomp $rawseq2;
+	chomp $qseq2;
+	$rawseq1 = uc($rawseq1);
+	$rawseq2 = uc($rawseq2);
+
+	$head1 =~ s/\s.*$// and $head2 =~ s/\s.*$//; # only the first field of ^@-line between R1/R2 is the same
+	next if $head1 ne $head2; # bad sequence, or misaligned sequence
+	$nseq++;
+
+	# bc-umi
+	my ($BC, $UMI) = &extract($rawseq1);
+	my $BCUMI = "${BC}_${UMI}";
+	# align
+	my ($bool, $seq) = &align($rawseq2);
+	if ($bool) {
+		$result{$BCUMI}{$seq}++;
+	} else {
+		$nseqmis++;
+	}
+
+	# progress
+	printf STDOUT "\r[process] n=$nseq/$nseqmis/(%.1f%%) speed=%.2f/sec", $nseqmis/$nseq * 100, $nseq / (time() - $time0 + 1);
+}
+print STDOUT "\n";
+close FQ1;
+close FQ2;
+
+# select the max freq seq for each unique CB-UMI
+my %CB;
+my @keys_sorted = sort { $a cmp $b } keys %result;
+foreach my $key (@keys_sorted) {
+	my ($CB, $UMI) = split /_/, $key;
+	my %hash = %{$result{$key}};
+	if (%hash == 1) {
+		my $SB= (keys %hash)[0];
+		my $n= (values %hash)[0];
+		$CB{$CB}{$UMI} = [$SB,$n];
+	} else {
+		my ($address, $bool) = &checkSeq(\%hash);
+		$bool and $CB{$CB}{$UMI} = $address;
+	}
+}
+
+# select the max freq umi for each sb
+my $Ncount = 0;
+my $Numi = 0;
+my $Nbc = 0;
+foreach my $CB (keys %CB) {
+	my %UMI = %{$CB{$CB}};
+	
+	foreach my $address (values %UMI) {
+		my ($SB,$n) = @$address;
+		$Ncount += $n;
+		$Numi ++;
+	}
+	$Nbc++;
+}
+
+
+
+# out
+unless (%WL) {
+	print OUT "CellBarcode\tUMI\tStaticBarcode\tCount\n";
+	my $Ncount = 0;
+	my $Numi = 0;
+	my $Nbc = 0;
+	foreach my $CB (keys %CB) {
+		my %UMI = %{$CB{$CB}};
+		
+		foreach my $UMI (keys %UMI) {
+			my ($SB,$n) = @{$UMI{$UMI}};
+			print OUT "$CB\t$UMI\t$SB\t$n\n";
+			$Ncount += $n;
+			$Numi ++;
+		}
+		$Nbc++;
+	}
+	printf STDOUT "[out] Find $Nbc CellBarcodes, $Numi UMIs.\n";
+} else {
+	print OUT "CellBarcode\tUMI\tStaticBarcode\tCount\tIN_GEX\n";
+	my $Ncount = 0;
+	my $Numi = 0;
+	my $Nbc = 0;
+	my $nBC_real = 0;
+	my $nUMI_real = 0;
+	my $nWL = %WL;
+	foreach my $CB (keys %CB) {
+		my %UMI = %{$CB{$CB}};
+		my $bool = int(exists $WL{$CB});
+		$bool and $nBC_real++ and $nUMI_real += keys %UMI;
+		
+		foreach my $UMI (keys %UMI) {
+			my ($SB,$n) = @{$UMI{$UMI}};
+			print OUT "$CB\t$UMI\t$SB\t$n\t$bool\n";
+			$Ncount += $n;
+			$Numi ++;
+		}
+		$Nbc++;
+	}
+	printf STDOUT "[out] Find $nBC_real/$Nbc/$nWL CellBarcodes(real/allTest/allReal), $nUMI_real/$Numi UMIs(real/allTest).\n";
+}
+close OUT;
+
+
+
+
+sub extract {
+	return (
+		substr($_[0], 0, 16),
+		substr($_[0], 16, 12),
+	);
+}
+
+sub align {
+	return $_[0] =~ m/${pattern}/ ? (1, $1) : (0, '');
+}
+
+sub checkSeq {
+	my %Seq = %{$_[0]};
+	my @keys_sorted = sort { $Seq{$b} <=> $Seq{$a} } keys %Seq;
+
+	$Seq{$keys_sorted[0]} == $Seq{$keys_sorted[1]} ?
+		return ([], 0) :
+		return ([$keys_sorted[0], $Seq{$keys_sorted[0]}], 1) ;
+}
